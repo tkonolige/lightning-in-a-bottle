@@ -1,0 +1,20 @@
+[package]
+name = "lightning-in-a-bottle"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cortex-m = "*"
+cortex-m-rtic = "*"
+cortex-m-rt = "*"
+nrf52832-hal = { version = "*", features = ["rt"] }
+defmt = "*"
+defmt-rtt = "*"
+panic-probe = {version = "*", features=["print-defmt"]}
+smart-leds = "*"
+apa102-spi = "*"
+
+[profile.release]
+debug = true
