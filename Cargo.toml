@@ -14,7 +14,8 @@ defmt = "*"
 defmt-rtt = "*"
 panic-probe = {version = "*", features=["print-defmt"]}
 smart-leds = "*"
-apa102-spi = "*"
+# apa102-spi = "*"
+ws2812-spi = "*"
 
 [profile.release]
 debug = true
