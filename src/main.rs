@@ -11,11 +11,12 @@ use smart_leds::RGB8;
 
 #[repr(C, align(8))]
 pub struct LEDStrip<Timer, SPIM, PPI> {
-    control_bits: [u8; 6144], // 500 leds * 12 bytes/led + 25 byte for reset rounded up to the nearest multiple of 256 bytes
+    control_bits: &'static mut [u8; 6144], // 500 leds * 12 bytes/led + 25 byte for reset rounded up to the nearest multiple of 256 bytes
     counter: Timer,
     spi: SPIM,
     ppi: PPI,
     pin: Pin<Output<PushPull>>,
+    sck_pin: Pin<Output<PushPull>>,
 }
 impl<Timer, SPIM, PPI> LEDStrip<Timer, SPIM, PPI>
 where
@@ -28,13 +29,16 @@ where
         spi: SPIM,
         ppi: PPI,
         pin: Pin<Output<PushPull>>,
+        sck_pin: Pin<Output<PushPull>>,
+        control_bits: &'static mut [u8; 6144],
     ) -> LEDStrip<Timer, SPIM, PPI> {
         LEDStrip {
-            control_bits: [0; 6144],
+            control_bits,
             counter,
             spi,
             ppi,
             pin,
+            sck_pin,
         }
     }
 
@@ -44,17 +48,16 @@ where
             unsafe { x.bits(self.pin.psel_bits()) };
             x.connect().connected()
         });
-        // dont need the other outputs
+        // sck must be connected
         self.spi.psel.sck.write(|x| {
-            unsafe { x.pin().bits(12) };
+            unsafe { x.bits(self.sck_pin.psel_bits()) };
             x.connect().connected()
         });
+        // dont need the other outputs
         self.spi.psel.miso.write(|x| {
-            unsafe { x.pin().bits(11) };
-            x.connect().connected()
+            unsafe { x.bits(11) };
+            x.connect().disconnected()
         });
-        // self.spi.psel.sck.write(|x|x.connect().disconnected());
-        // self.spi.psel.miso.write(|x|x.connect().disconnected());
         self.spi.enable.write(|x| x.enable().enabled());
         self.spi.frequency.write(|x| x.frequency().m4());
         self.spi
@@ -72,9 +75,6 @@ where
         self.spi.rxd.maxcnt.write(|x| unsafe { x.maxcnt().bits(0) });
         // start next transfer as soon as a transfer is finished
         self.spi.shorts.write(|x| x.end_start().enabled());
-        // self.spi
-        //     .intenset
-        //     .write(|x| x.endtx().set().endrx().set().end().set());
 
         self.counter.mode.write(|x| x.mode().counter());
         self.counter.bitmode.write(|x| x.bitmode()._32bit());
@@ -147,100 +147,90 @@ mod lightstrip {
     // use apa102_spi as apa102;
     use defmt_rtt as _; // for logging
     use hal::gpio::Level;
-    use hal::pac::{SPIM0, TIMER1, TIMER2};
-    use hal::ppi::Ppi0;
+    use hal::pac::{SPIM0, TIMER1, TIMER2, TIMER0, SPIM1, SPIM2, TIMER3};
+    use hal::timer::Instance;
+    use hal::ppi::{Ppi0, Ppi1, Ppi2};
     use hal::prelude::*;
     use nrf52832_hal as hal;
     use smart_leds::{gamma, hsv::hsv2rgb, hsv::Hsv, SmartLedsWrite, RGB8};
+
+    static mut led_bits: [u8; 6144] = [0; 6144];
+    static mut led_bits2: [u8; 6144] = [0; 6144];
+    static mut led_bits3: [u8; 6144] = [0; 6144];
+
     #[shared]
     struct Shared {
         leds: crate::LEDStrip<TIMER2, SPIM0, Ppi0>,
+        leds2: crate::LEDStrip<TIMER0, SPIM1, Ppi1>,
+        leds3: crate::LEDStrip<TIMER1, SPIM2, Ppi2>,
+        j: usize,
     }
     #[local]
     struct Local {
-        timer: hal::Timer<TIMER1, hal::timer::Periodic>,
+        timer: hal::Timer<TIMER3, hal::timer::Periodic>,
         // This is state used locally at every tick of the timer. You can access them via
         // `ctx.local.variable` within the fimer function.
         // If you need some state, add it here.
-        j: usize,
     }
 
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
         let _clocks = hal::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
-        let sck = p0.p0_12.into_push_pull_output(Level::Low).degrade();
-        let mosi = p0.p0_13.into_push_pull_output(Level::Low).degrade();
-        let miso = p0.p0_11.into_pulldown_input().degrade();
         let mut status_led = p0.p0_17.into_push_pull_output(Level::Low).degrade();
         status_led.set_high().unwrap();
 
         let ppi_channels = hal::ppi::Parts::new(ctx.device.PPI);
+        let mosi = p0.p0_13.into_push_pull_output(Level::Low).degrade();
+        let sck_1 = p0.p0_11.into_push_pull_output(Level::Low).degrade();
         let mut leds =
-            crate::LEDStrip::new(ctx.device.TIMER2, ctx.device.SPIM0, ppi_channels.ppi0, mosi);
+            crate::LEDStrip::new(ctx.device.TIMER2, ctx.device.SPIM0, ppi_channels.ppi0, mosi, sck_1, unsafe {&mut led_bits});
         leds.configure();
-        leds.set_data(gamma(
-            // This code computes the actual color. It returns an iterator of length equal to
-            // the number of leds
-            (0..500).map(|i| {
-                hsv2rgb(Hsv {
-                    hue: 0,
-                    sat: 0,
-                    // the led strip can draw a LOT of power if this value is set high.
-                    // Probably safest to leave it at 150 for now
-                    val: 100,
-                })
-            }),
-        ));
         leds.start();
 
-        let mut timer = hal::Timer::periodic(ctx.device.TIMER1);
+        let miso = p0.p0_14.into_push_pull_output(Level::Low).degrade();
+        let sck_2 = p0.p0_10.into_push_pull_output(Level::Low).degrade();
+        let mut leds2 =
+            crate::LEDStrip::new(ctx.device.TIMER0, ctx.device.SPIM1, ppi_channels.ppi1, miso, sck_2, unsafe{&mut led_bits2});
+        leds2.configure();
+        leds2.start();
+
+        let p15 = p0.p0_15.into_push_pull_output(Level::Low).degrade();
+        let sck_3 = p0.p0_09.into_push_pull_output(Level::Low).degrade();
+        let mut leds3 =
+            crate::LEDStrip::new(ctx.device.TIMER1, ctx.device.SPIM2, ppi_channels.ppi2, p15, sck_3, unsafe{&mut led_bits2});
+        leds3.configure();
+        leds3.start();
+
+        let mut timer = hal::Timer::periodic(ctx.device.TIMER3);
         timer.enable_interrupt();
         let update_delay: u32 = 10_000;
         timer.start(update_delay); // 100 times a second
 
-        (Shared { leds }, Local { timer, j: 0 }, init::Monotonics())
+        (Shared { leds, leds2, leds3, j: 0  }, Local { timer, }, init::Monotonics())
     }
 
     // This is called 100 times a second
-    #[task(binds=TIMER1, local=[timer], shared=[leds])]
-    fn timer1(mut ctx: timer1::Context) {
+    #[task(binds=TIMER3, local=[timer], shared=[j], priority=3)]
+    fn timer3(mut ctx: timer3::Context) {
         // this resets the timer so it doesn't fire until the timeout is hit again
         ctx.local
             .timer
             .event_compare_cc0()
             .write(|x| unsafe { x.bits(0) });
-
-        ctx.shared.leds.lock(|leds| {
-            // leds.configure();
-            // leds.set_data(gamma(
-            //     // This code computes the actual color. It returns an iterator of length equal to
-            //     // the number of leds
-            //     (0..500).map(|i| {
-            //         hsv2rgb(Hsv {
-            //             hue: ((i * 3 + *ctx.local.j / 3) % 256) as u8,
-            //             sat: 150,
-            //             // the led strip can draw a LOT of power if this value is set high.
-            //             // Probably safest to leave it at 150 for now
-            //             val: 100,
-            //         })
-            //     }),
-            // ));
-            // leds.start();
-        });
-        // *ctx.local.j += 1;
+        ctx.shared.j.lock(|j| *j += 1);
     }
 
-    #[task(binds=TIMER2, shared=[leds], local=[j])]
-    fn timer2(mut ctx: timer2::Context) {
-        ctx.shared.leds.lock(|leds| {
+    #[task(binds=TIMER2, shared=[leds, j])]
+    fn timer2(ctx: timer2::Context) {
+        (ctx.shared.leds, ctx.shared.j).lock(|leds, j| {
             leds.interrupt();
             leds.set_data(gamma(
                 // This code computes the actual color. It returns an iterator of length equal to
                 // the number of leds
                 (0..500).map(|i| {
                     hsv2rgb(Hsv {
-                        hue: ((i * 3 + *ctx.local.j / 3) % 256) as u8,
+                        hue: ((i * 3 + *j / 3) % 256) as u8,
                         sat: 150,
                         // the led strip can draw a LOT of power if this value is set high.
                         // Probably safest to leave it at 150 for now
@@ -250,6 +240,47 @@ mod lightstrip {
             ));
             leds.start();
         });
-        *ctx.local.j += 10;
+    }
+
+    #[task(binds=TIMER0, shared=[leds2, j], priority=2)]
+    fn timer0(ctx: timer0::Context) {
+        (ctx.shared.leds2, ctx.shared.j).lock(|leds, j| {
+            leds.interrupt();
+            leds.set_data(gamma(
+                // This code computes the actual color. It returns an iterator of length equal to
+                // the number of leds
+                (0..500).map(|i| {
+                    hsv2rgb(Hsv {
+                        hue: ((i * 3 + *j / 3) % 256) as u8,
+                        sat: 150,
+                        // the led strip can draw a LOT of power if this value is set high.
+                        // Probably safest to leave it at 150 for now
+                        val: 150,
+                    })
+                }),
+            ));
+            leds.start();
+        });
+    }
+
+    #[task(binds=TIMER1, shared=[leds3, j], priority=2)]
+    fn timer1(ctx: timer1::Context) {
+        (ctx.shared.leds3, ctx.shared.j).lock(|leds, j| {
+            leds.interrupt();
+            leds.set_data(gamma(
+                // This code computes the actual color. It returns an iterator of length equal to
+                // the number of leds
+                (0..500).map(|i| {
+                    hsv2rgb(Hsv {
+                        hue: ((i * 3 + *j / 3) % 256) as u8,
+                        sat: 150,
+                        // the led strip can draw a LOT of power if this value is set high.
+                        // Probably safest to leave it at 150 for now
+                        val: 150,
+                    })
+                }),
+            ));
+            leds.start();
+        });
     }
 }
