@@ -90,7 +90,7 @@ where
         // enable spi
         self.spi
             .config
-            .write(|x| x.order().msb_first().cpol().active_low().cpha().leading());
+            .write(|x| x.order().msb_first().cpol().active_low().cpha().trailing());
         self.spi.orc.write(|x| unsafe { x.orc().bits(0) });
         compiler_fence(SeqCst);
     }
@@ -241,10 +241,10 @@ mod lightstrip {
                 (0..500).map(|i| {
                     hsv2rgb(Hsv {
                         hue: ((i * 3 + *ctx.local.j / 3) % 256) as u8,
-                        sat: 50,
+                        sat: 150,
                         // the led strip can draw a LOT of power if this value is set high.
                         // Probably safest to leave it at 150 for now
-                        val: 50,
+                        val: 150,
                     })
                 }),
             ));
