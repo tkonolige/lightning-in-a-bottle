@@ -1,28 +1,34 @@
 #![no_std]
 #![no_main]
 
+use core::ops::Deref;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use hal::gpio::{Output, Pin, PushPull};
 use hal::prelude::*;
 use nrf52832_hal as hal;
 use panic_probe as _;
-use smart_leds::{ RGB8};
+use smart_leds::RGB8;
 
 #[repr(C, align(8))]
-pub struct LEDStrip {
-    control_bits: [u8; 6144], // 500 leds * 12 bytes/led + 20 byte for reset rounded up to the nearest multiple of 256 bytes
-    counter: hal::pac::TIMER2,
-    spi: hal::pac::SPIM0,
-    ppi: hal::ppi::Ppi0,
+pub struct LEDStrip<Timer, SPIM, PPI> {
+    control_bits: [u8; 6144], // 500 leds * 12 bytes/led + 25 byte for reset rounded up to the nearest multiple of 256 bytes
+    counter: Timer,
+    spi: SPIM,
+    ppi: PPI,
     pin: Pin<Output<PushPull>>,
 }
-impl LEDStrip {
+impl<Timer, SPIM, PPI> LEDStrip<Timer, SPIM, PPI>
+where
+    Timer: Deref<Target = hal::pac::timer0::RegisterBlock>,
+    SPIM: Deref<Target = hal::pac::spim0::RegisterBlock>,
+    PPI: hal::ppi::ConfigurablePpi,
+{
     fn new(
-        counter: hal::pac::TIMER2,
-        spi: hal::pac::SPIM0,
-        ppi: hal::ppi::Ppi0,
+        counter: Timer,
+        spi: SPIM,
+        ppi: PPI,
         pin: Pin<Output<PushPull>>,
-    ) -> LEDStrip {
+    ) -> LEDStrip<Timer, SPIM, PPI> {
         LEDStrip {
             control_bits: [0; 6144],
             counter,
@@ -56,7 +62,10 @@ impl LEDStrip {
             .ptr
             .write(|x| unsafe { x.ptr().bits(self.control_bits.as_ptr() as u32) });
         // read 256 bytes at a time
-        self.spi.txd.maxcnt.write(|x| unsafe { x.maxcnt().bits(0xff) });
+        self.spi
+            .txd
+            .maxcnt
+            .write(|x| unsafe { x.maxcnt().bits(0xff) });
         // advance pointer 256 bytes each time
         self.spi.txd.list.write(|x| x.list().array_list());
         // receive nothing
@@ -73,7 +82,7 @@ impl LEDStrip {
         // count up to the total number of sends
         self.counter.cc[0].write(|x| unsafe { x.bits((self.control_bits.len() / 256 - 1) as u32) });
         self.counter.intenset.write(|x| x.compare0().set());
-        self.counter.tasks_start.write(|x| unsafe {x.bits(1)});
+        self.counter.tasks_start.write(|x| unsafe { x.bits(1) });
         self.ppi.set_task_endpoint(&self.counter.tasks_count);
         self.ppi.set_event_endpoint(&self.spi.events_end);
         self.ppi.enable();
@@ -138,14 +147,14 @@ mod lightstrip {
     // use apa102_spi as apa102;
     use defmt_rtt as _; // for logging
     use hal::gpio::Level;
-    use hal::pac::TIMER1;
+    use hal::pac::{SPIM0, TIMER1, TIMER2};
+    use hal::ppi::Ppi0;
     use hal::prelude::*;
     use nrf52832_hal as hal;
     use smart_leds::{gamma, hsv::hsv2rgb, hsv::Hsv, SmartLedsWrite, RGB8};
-    use ws2812_spi::prerendered as ws2812;
     #[shared]
     struct Shared {
-        leds: crate::LEDStrip,
+        leds: crate::LEDStrip<TIMER2, SPIM0, Ppi0>,
     }
     #[local]
     struct Local {
@@ -153,13 +162,8 @@ mod lightstrip {
         // This is state used locally at every tick of the timer. You can access them via
         // `ctx.local.variable` within the fimer function.
         // If you need some state, add it here.
-        // leds: apa102::Apa102<hal::spi::Spi<hal::pac::SPI0>>,
-        // leds: ws2812::Ws2812<'static, hal::spi::Spi<hal::pac::SPI0>>,
         j: usize,
     }
-
-    // must be # leds * 12 + 40
-    // static mut SPI_DATA: [u8; 300 * 12 + 40] = [0; 300 * 12 + 40];
 
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
@@ -237,15 +241,15 @@ mod lightstrip {
                 (0..500).map(|i| {
                     hsv2rgb(Hsv {
                         hue: ((i * 3 + *ctx.local.j / 3) % 256) as u8,
-                        sat: 150,
+                        sat: 50,
                         // the led strip can draw a LOT of power if this value is set high.
                         // Probably safest to leave it at 150 for now
-                        val: 100,
+                        val: 50,
                     })
                 }),
             ));
             leds.start();
         });
-        *ctx.local.j += 1;
+        *ctx.local.j += 10;
     }
 }
