@@ -16,6 +16,7 @@ panic-probe = {version = "*", features=["print-defmt"]}
 smart-leds = "*"
 # apa102-spi = "*"
 ws2812-spi = "*"
+libm = "*"
 
 [profile.release]
 debug = true
