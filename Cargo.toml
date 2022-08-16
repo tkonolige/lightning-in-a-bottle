@@ -20,3 +20,11 @@ libm = "*"
 
 [profile.release]
 debug = true
+
+[[bin]]
+name = "boxx"
+path = "src/boxx.rs"
+
+[[bin]]
+name = "remote"
+path = "src/remote.rs"

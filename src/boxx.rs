@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod radio;
+
 use core::ops::Deref;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use hal::gpio::{Output, Pin, PushPull};
@@ -116,7 +118,7 @@ where
         let mut total_draw_mA: usize = 0;
         let patterns = [0b1000_1000, 0b1000_1110, 0b1110_1000, 0b1110_1110];
         // let patterns = [0b1110_1110, 0b1110_1110, 0b1110_1110, 0b1110_1110];
-        for (i, rgb) in gamma(brightness(iterator, br)).enumerate() {
+        for (i, rgb) in brightness(gamma(iterator), br).enumerate() {
             let r = rgb.r as usize;
             let r_l = r / 50 * 50;
             let r_h = (r + 49) / 50 * 50;
@@ -130,7 +132,6 @@ where
             let draw_g = (pixel_draw[g_l / 50] * (g - g_l) + pixel_draw[g_h / 50] * (g_h - g)) / 50;
             let draw_b = (pixel_draw[b_l / 50] * (b - b_l) + pixel_draw[b_h / 50] * (b_h - b)) / 50;
             total_draw_mA += (draw_r + draw_g + draw_b) / 3;
-            assert!(i < LEDS_PER_STRIP, "Max {LEDS_PER_STRIP} leds");
             self.control_bits[i * 12 + 0] = patterns[((rgb.g & 0b1100_0000) >> 6) as usize];
             self.control_bits[i * 12 + 1] = patterns[((rgb.g & 0b0011_0000) >> 4) as usize];
             self.control_bits[i * 12 + 2] = patterns[((rgb.g & 0b0000_1100) >> 2) as usize];
@@ -144,6 +145,7 @@ where
             self.control_bits[i * 12 + 10] = patterns[((rgb.b & 0b0000_1100) >> 2) as usize];
             self.control_bits[i * 12 + 11] = patterns[((rgb.b & 0b0000_0011) >> 0) as usize];
         }
+        // panic!("{}", total_draw_mA);
         assert!(total_draw_mA < 10_000, "total draw (mA): {total_draw_mA}");
     }
 
@@ -180,8 +182,8 @@ fn xorshift(seed: u32, inp: u32) -> (u32, u32) {
     ((x >> 32) as u32, (x & 0xffffffff) as u32)
 }
 
-#[rtic::app(device = crate::lightstrip::hal::pac, peripherals=true)]
-mod lightstrip {
+#[rtic::app(device = crate::boxx::hal::pac, peripherals=true)]
+mod boxx {
     // use apa102_spi as apa102;
     use core::ops::Deref;
     use defmt_rtt as _; // for logging
@@ -191,6 +193,7 @@ mod lightstrip {
     use nrf52832_hal as hal;
     use smart_leds::{gamma, hsv::hsv2rgb, hsv::Hsv};
 
+    use crate::radio::{Command, Message, Radio, RadioState, MESSAGE_LENGTH};
     use crate::*;
 
     #[derive(Eq, PartialEq, Copy, Clone, Debug)]
@@ -201,9 +204,22 @@ mod lightstrip {
         Off,
     }
 
+    impl Effect {
+        pub fn next_effect(self) -> Self {
+            match self {
+                Self::Rainbow => Self::Lightning,
+                Self::Lightning => Self::Breathing,
+                Self::Breathing => Self::Rainbow,
+                Self::Off => Self::Rainbow,
+            }
+        }
+    }
+
     static mut LED_BITS1: [u8; LED_BYTES] = [0; LED_BYTES];
     static mut LED_BITS2: [u8; LED_BYTES] = [0; LED_BYTES];
     static mut LED_BITS3: [u8; LED_BYTES] = [0; LED_BYTES];
+    static mut RECV_BUF: [u8; MESSAGE_LENGTH] = [0; MESSAGE_LENGTH];
+    static mut SEND_BUF: [u8; MESSAGE_LENGTH] = [0; MESSAGE_LENGTH];
 
     #[shared]
     struct Shared {
@@ -217,9 +233,11 @@ mod lightstrip {
     #[local]
     struct Local {
         timer: hal::Timer<TIMER3, hal::timer::Periodic>,
+        radio: Radio,
         // This is state used locally at every tick of the timer. You can access them via
         // `ctx.local.variable` within the fimer function.
         // If you need some state, add it here.
+        status_led: Pin<Output<PushPull>>,
     }
 
     #[init]
@@ -227,7 +245,6 @@ mod lightstrip {
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
         let _clocks = hal::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
         let mut status_led = p0.p0_17.into_push_pull_output(Level::Low).degrade();
-        status_led.set_high().unwrap();
 
         let ppi_channels = hal::ppi::Parts::new(ctx.device.PPI);
         let mosi = p0.p0_12.into_push_pull_output(Level::Low).degrade();
@@ -274,6 +291,12 @@ mod lightstrip {
         let update_delay: u32 = 10_000;
         timer.start(update_delay); // 100 times a second
 
+        let mut radio = Radio::new(ctx.device.RADIO, 0, 0b10);
+        // start receiving
+        unsafe {
+            radio.recv(&mut RECV_BUF);
+        }
+
         (
             Shared {
                 leds,
@@ -281,9 +304,13 @@ mod lightstrip {
                 leds3,
                 j: 0,
                 effect: Effect::Breathing,
-                brightness: 255,
+                brightness: 150,
             },
-            Local { timer },
+            Local {
+                radio,
+                timer,
+                status_led,
+            },
             init::Monotonics(),
         )
     }
@@ -396,7 +423,11 @@ mod lightstrip {
             }
             Effect::Off => {
                 leds.set_data(0, {
-                    (0..LEDS_PER_STRIP).map(|_| RGB8 { r: 0, g: 0, b: 0 })
+                    (0..LEDS_PER_STRIP).map(|_| RGB8 {
+                        r: 100,
+                        g: 2,
+                        b: 100,
+                    })
                 });
             }
         }
@@ -445,5 +476,58 @@ mod lightstrip {
                 colors(leds, *effect, *brightness, *j);
                 leds.start();
             });
+    }
+
+    #[task(binds = RADIO, shared=[effect, brightness], local = [radio, status_led], priority = 3)]
+    fn radio(mut ctx: radio::Context) {
+        // defmt::info!("in radio");
+        ctx.local.status_led.set_high();
+        if ctx.local.radio.state() == &RadioState::Receiving {
+            // defmt::info!("recv");
+            let (success, addr) = ctx.local.radio.read_packet();
+            if !success {
+                // defmt::info!("failure!");
+                unsafe {
+                    ctx.local.radio.recv(&mut RECV_BUF);
+                }
+                return;
+            }
+
+            let message = Message::from(unsafe { &RECV_BUF });
+            match message.cmd {
+                Command::NextAnimation => ctx
+                    .shared
+                    .effect
+                    .lock(|effect| *effect = (*effect).next_effect()),
+                Command::BrightnessUp => ctx
+                    .shared
+                    .brightness
+                    .lock(|brightness| *brightness = brightness.saturating_add(20)),
+                Command::BrightnessDown => ctx
+                    .shared
+                    .brightness
+                    .lock(|brightness| *brightness = brightness.saturating_sub(20).max(20)),
+                Command::TurnOff => ctx.shared.effect.lock(|effect| *effect = Effect::Off),
+            }
+
+            unsafe {
+                // defmt::info!("recieved from {}: {:042b}", addr, new_matrix.matrix);
+            }
+            // TODO: send to correct half
+            // update current view of each half and send buffer
+            unsafe {
+                SEND_BUF[0] = message.ack_number;
+            }
+
+            compiler_fence(SeqCst);
+            unsafe {
+                ctx.local.radio.send_from(0, &mut SEND_BUF);
+            }
+        } else if ctx.local.radio.state() == &RadioState::Sending {
+            ctx.local.radio.send_complete();
+            unsafe {
+                ctx.local.radio.recv(&mut RECV_BUF);
+            }
+        }
     }
 }
