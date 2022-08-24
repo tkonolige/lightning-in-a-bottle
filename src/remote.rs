@@ -189,7 +189,7 @@ mod remote {
         } else if ctx.local.pin_br_up.is_low().unwrap() {
             Command::BrightnessUp
         } else if ctx.local.pin_br_down.is_low().unwrap() {
-        ctx.shared.status_led.lock(|led| led.set_high().unwrap());
+            ctx.shared.status_led.lock(|led| led.set_high().unwrap());
             Command::BrightnessDown
         } else if ctx.local.pin_off.is_low().unwrap() {
             Command::TurnOff

@@ -13,6 +13,7 @@ pub enum Command {
     BrightnessUp,
     BrightnessDown,
     TurnOff,
+    Inc,
 }
 
 impl Command {
@@ -22,6 +23,7 @@ impl Command {
             Self::BrightnessUp => 1,
             Self::BrightnessDown => 2,
             Self::TurnOff => 3,
+            Self::Inc => 4,
         }
     }
 }
@@ -35,6 +37,7 @@ impl TryFrom<u8> for Command {
             1 => Ok(Self::BrightnessUp),
             2 => Ok(Self::BrightnessDown),
             3 => Ok(Self::TurnOff),
+            4 => Ok(Self::Inc),
             _ => Err(()),
         }
     }

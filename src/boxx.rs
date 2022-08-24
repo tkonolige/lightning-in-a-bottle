@@ -16,6 +16,8 @@ const BOX_LENGTH: usize = 300;
 // 600 leds * 12 bytes/led + 25 byte for reset rounded up to the nearest multiple of 256 bytes
 const LED_BYTES: usize = (LEDS_PER_STRIP * 12 + 50 + 255) / 256 * 256;
 
+const IS_HOST: bool = true;
+
 #[repr(C, align(8))]
 pub struct LEDStrip<Timer, SPIM, PPI> {
     control_bits: &'static mut [u8; LED_BYTES],
@@ -190,6 +192,7 @@ mod boxx {
     use hal::gpio::Level;
     use hal::pac::{SPIM0, SPIM1, SPIM2, TIMER0, TIMER1, TIMER2, TIMER3};
     use hal::ppi::{Ppi0, Ppi1, Ppi2};
+    use hal::uarte;
     use nrf52832_hal as hal;
     use smart_leds::{gamma, hsv::hsv2rgb, hsv::Hsv};
 
@@ -229,6 +232,7 @@ mod boxx {
         j: usize,
         effect: Effect,
         brightness: u8,
+        urt: uarte::Uarte<hal::pac::UARTE0>,
     }
     #[local]
     struct Local {
@@ -244,10 +248,14 @@ mod boxx {
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
         let _clocks = hal::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
-        let mut status_led = p0.p0_17.into_push_pull_output(Level::Low).degrade();
+        let status_led = p0.p0_17.into_push_pull_output(Level::Low).degrade();
 
         let ppi_channels = hal::ppi::Parts::new(ctx.device.PPI);
-        let mosi = p0.p0_12.into_push_pull_output(Level::Low).degrade();
+        let mosi = if IS_HOST {
+            p0.p0_13.into_push_pull_output(Level::Low).degrade()
+        } else {
+            p0.p0_13.into_push_pull_output(Level::Low).degrade()
+        };
         let sck_1 = p0.p0_11.into_push_pull_output(Level::Low).degrade();
         let mut leds = crate::LEDStrip::new(
             ctx.device.TIMER2,
@@ -260,7 +268,11 @@ mod boxx {
         leds.configure();
         leds.start();
 
-        let miso = p0.p0_13.into_push_pull_output(Level::Low).degrade();
+        let miso = if IS_HOST {
+            p0.p0_14.into_push_pull_output(Level::Low).degrade()
+        } else {
+            p0.p0_14.into_push_pull_output(Level::Low).degrade()
+        };
         let sck_2 = p0.p0_10.into_push_pull_output(Level::Low).degrade();
         let mut leds2 = crate::LEDStrip::new(
             ctx.device.TIMER0,
@@ -273,7 +285,11 @@ mod boxx {
         leds2.configure();
         leds2.start();
 
-        let p15 = p0.p0_14.into_push_pull_output(Level::Low).degrade();
+        let p15 = if IS_HOST {
+            p0.p0_08.into_push_pull_output(Level::Low).degrade()
+        } else {
+            p0.p0_08.into_push_pull_output(Level::Low).degrade()
+        };
         let sck_3 = p0.p0_09.into_push_pull_output(Level::Low).degrade();
         let mut leds3 = crate::LEDStrip::new(
             ctx.device.TIMER1,
@@ -287,15 +303,43 @@ mod boxx {
         leds3.start();
 
         let mut timer = hal::Timer::periodic(ctx.device.TIMER3);
-        timer.enable_interrupt();
-        let update_delay: u32 = 10_000;
-        timer.start(update_delay); // 100 times a second
+        if IS_HOST {
+            timer.enable_interrupt();
+            let update_delay: u32 = 10_000;
+            timer.start(update_delay); // 100 times a second
+        }
 
         let mut radio = Radio::new(ctx.device.RADIO, 0, 0b10);
-        // start receiving
-        unsafe {
-            radio.recv(&mut RECV_BUF);
+        if IS_HOST {
+            // start receiving
+            unsafe {
+                radio.recv(&mut RECV_BUF);
+            }
         }
+
+        // setup device-device communication
+        let (txd, rxd) = if IS_HOST {
+            (
+                p0.p0_30.into_push_pull_output(Level::High).degrade(),
+                p0.p0_31.into_floating_input().degrade(),
+            )
+        } else {
+            (
+                p0.p0_31.into_push_pull_output(Level::High).degrade(),
+                p0.p0_30.into_floating_input().degrade(),
+            )
+        };
+        let urt = uarte::Uarte::new(
+            ctx.device.UARTE0,
+            uarte::Pins {
+                txd,
+                rxd,
+                cts: None,
+                rts: None,
+            },
+            uarte::Parity::EXCLUDED,
+            uarte::Baudrate::BAUD115200,
+        );
 
         (
             Shared {
@@ -305,6 +349,7 @@ mod boxx {
                 j: 0,
                 effect: Effect::Breathing,
                 brightness: 150,
+                urt,
             },
             Local {
                 radio,
@@ -316,14 +361,18 @@ mod boxx {
     }
 
     // This is called 100 times a second
-    #[task(binds=TIMER3, local=[timer], shared=[j], priority=3)]
+    #[task(binds=TIMER3, local=[timer], shared=[j, urt], priority=3)]
     fn timer3(mut ctx: timer3::Context) {
         // this resets the timer so it doesn't fire until the timeout is hit again
         ctx.local
             .timer
             .event_compare_cc0()
             .write(|x| unsafe { x.bits(0) });
-        ctx.shared.j.lock(|j| *j += 1);
+        (ctx.shared.j, ctx.shared.urt).lock(|j, urt| {
+            *j += 1;
+            let msg = [Command::Inc.to_int()];
+            urt.write(&msg).unwrap();
+        });
     }
 
     fn colors<T, S, P>(
@@ -478,10 +527,10 @@ mod boxx {
             });
     }
 
-    #[task(binds = RADIO, shared=[effect, brightness], local = [radio, status_led], priority = 3)]
+    #[task(binds = RADIO, shared=[effect, brightness, urt], local = [radio, status_led], priority = 3)]
     fn radio(mut ctx: radio::Context) {
         // defmt::info!("in radio");
-        ctx.local.status_led.set_high();
+        ctx.local.status_led.set_high().unwrap();
         if ctx.local.radio.state() == &RadioState::Receiving {
             // defmt::info!("recv");
             let (success, addr) = ctx.local.radio.read_packet();
@@ -507,8 +556,11 @@ mod boxx {
                     .shared
                     .brightness
                     .lock(|brightness| *brightness = brightness.saturating_sub(20).max(20)),
+                Command::Inc => (),
                 Command::TurnOff => ctx.shared.effect.lock(|effect| *effect = Effect::Off),
             }
+            let msg = [message.cmd.to_int()];
+            ctx.shared.urt.lock(|urt| urt.write(&msg).unwrap());
 
             unsafe {
                 // defmt::info!("recieved from {}: {:042b}", addr, new_matrix.matrix);
@@ -527,6 +579,36 @@ mod boxx {
             ctx.local.radio.send_complete();
             unsafe {
                 ctx.local.radio.recv(&mut RECV_BUF);
+            }
+        }
+    }
+
+    #[idle(shared=[urt, effect, brightness, j])]
+    fn idle(mut ctx: idle::Context) -> ! {
+        if IS_HOST {
+            loop {}
+        } else {
+            loop {
+                let mut buf = [0; 1];
+                // TODO: this might block
+                ctx.shared.urt.lock(|urt| urt.read(&mut buf).unwrap());
+                let cmd: Command = buf[0].try_into().unwrap();
+                match cmd {
+                    Command::NextAnimation => ctx
+                        .shared
+                        .effect
+                        .lock(|effect| *effect = (*effect).next_effect()),
+                    Command::BrightnessUp => ctx
+                        .shared
+                        .brightness
+                        .lock(|brightness| *brightness = brightness.saturating_add(20)),
+                    Command::BrightnessDown => ctx
+                        .shared
+                        .brightness
+                        .lock(|brightness| *brightness = brightness.saturating_sub(20).max(20)),
+                    Command::Inc => ctx.shared.j.lock(|j| *j += 1),
+                    Command::TurnOff => ctx.shared.effect.lock(|effect| *effect = Effect::Off),
+                }
             }
         }
     }
